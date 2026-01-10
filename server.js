@@ -22,10 +22,18 @@ const app = express();
 // ✅ Middleware
 // app.use(cors({ origin: "http://localhost:3000", credentials: true }));
 app.use(cors({
-  origin: ["http://localhost:3000", "https://fhgeneralequipments.com"],
-  methods: ["GET", "POST", "PUT", "DELETE"],
-  credentials: true
+  origin: [
+    "http://localhost:3000",
+    "https://fhgeneralequipment.com",
+    "https://www.fhgeneralequipment.com"
+  ],
+  credentials: true,
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"]
 }));
+
+// ✅ Handle preflight properly
+app.options("*", cors());
 
 
 // app.use(express.json());
