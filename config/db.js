@@ -1,11 +1,11 @@
 const mongoose = require('mongoose');
 
 
-const MONGO_URI = 'mongodb+srv://fhuser:fhpassword@cluster0.zxgpcla.mongodb.net/FHgeneralEquipments';
+// const MONGO_URI = 'mongodb+srv://fhuser:fhpassword@cluster0.zxgpcla.mongodb.net/FHgeneralEquipments';
 
 
 
-console.log(MONGO_URI);
+// console.log(MONGO_URI);
 const db = mongoose.connect(MONGO_URI, {
   useNewUrlParser: true,
   useUnifiedTopology: true,
