@@ -1,8 +1,6 @@
 import express from "express";
 import mongoose from "mongoose";
-import cors from "cors";
-import dotenv from "dotenv";
-import path from "path";
+import corsMiddleware from "./middleware/corsMiddleware.js";
 
 import adminRoutes from "./routes/adminRoutes.js";
 import categoryRoutes from "./routes/categoryRoutes.js";
@@ -12,25 +10,10 @@ import postRoutes from "./routes/postRoutes.js"
 import mediaRoutes from "./routes/mediaRoutes.js";
 import contactRoute from "./routes/contactRoute.js";
 
-import { fileURLToPath } from "url";
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-dotenv.config();
 const app = express();
 
 // ✅ Middleware
-// app.use(cors({ origin: "http://localhost:3000", credentials: true }));
-app.use(cors({
-  origin: [
-    "http://localhost:3000",
-    "https://fhgeneralequipment.com",
-    "https://www.fhgeneralequipment.com"
-  ],
-  credentials: true,
-  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"]
-}));
+app.use(corsMiddleware);
 
 // ✅ Handle preflight properly
 // app.options("*", cors());
@@ -42,18 +25,19 @@ app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true }));
 
 
-// // app.use("/uploads", express.static("uploads"));
-// app.use("/uploads", express.static(path.join(__dirname, "uploads")));
-
-app.use('/uploads', express.static('/var/www/uploads'))
-
-// Serve uploads folder correctly
-// app.use("/uploads", express.static(path.join(__dirname, "uploads")));
-
 // ✅ MongoDB Connection
 mongoose
   .connect(process.env.MONGO_URI)
-  .then(() => console.log("✅ MongoDB connected successfully"))
+  .then(async () => {
+    console.log("✅ MongoDB connected successfully");
+    const { retryCloudinaryCleanup } = await import("./utils/cloudinaryImages.js");
+    const cleanupTimer = setInterval(() => {
+      retryCloudinaryCleanup().catch((error) => {
+        console.error("Cloudinary cleanup retry worker failed:", error);
+      });
+    }, 60_000);
+    cleanupTimer.unref();
+  })
   .catch((err) => console.log("❌ MongoDB connection error:", err));
 // import connectDB from "./db.js";
 // connectDB();

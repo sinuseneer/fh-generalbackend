@@ -1,97 +1,124 @@
+
 import express from "express";
-import multer from "multer";
-import fs from "fs";
 import Category_table from "../models/categoryModel.js";
+import { createImageUpload, isUploadError } from "../utils/imageUpload.js";
+import {
+  deleteCloudinaryImageOrQueue,
+  uploadImage,
+} from "../utils/cloudinaryImages.js";
+import { findImageUsage, hasImageUsage } from "../utils/imageReferences.js";
 
 const router = express.Router();
+const upload = createImageUpload({ fileSize: 5 * 1024 * 1024 });
 
 /* ==========================================================
-   🧱 Multer Storage Setup
+   1. ADD NEW CATEGORY
 ========================================================== */
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    const dir = "/var/www/uploads/categories";
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    cb(null, dir);
-  },
-  filename: (req, file, cb) => cb(null, Date.now() + "-" + file.originalname),
-});
 
-const upload = multer({ storage });
+router.post("/add", upload.single("image"), async (req, res) => {
+  let uploadedImage = null;
+  let saved = false;
 
-/* ==========================================================
-   ✅ 1. Add New Category  (priority auto = 0)
-========================================================== */
-router.post("/add", (req, res) => {
-  const singleUpload = upload.single("image");
+  try {
+    const { category_name } = req.body;
 
-  singleUpload(req, res, async (err) => {
-    if (err) {
-      console.error("Multer error while adding category:", err);
+    if (!category_name || !req.file) {
       return res.status(400).json({
         success: false,
-        message: err.message || "File upload error",
+        message: "Category name and image are required",
       });
     }
 
-    try {
-      const { category_name } = req.body;
-      const image = req.file ? `uploads/categories/${req.file.filename}` : null;
+    uploadedImage = await uploadImage(req.file, "fh-general-equipments/categories");
 
-      if (!category_name || !image) {
-        return res.status(400).json({
-          success: false,
-          message: "All fields required",
-        });
-      }
+    const newCategory = new Category_table({
+      category_name,
+      category_image: uploadedImage.secure_url,
+      category_image_public_id: uploadedImage.public_id,
+      priority: 0,
+    });
 
-      const newCategory = new Category_table({
-        category_name,
-        category_image: image,
-        priority: 0, // ⭐ default value
-      });
+    await newCategory.save();
+    saved = true;
 
-      await newCategory.save();
-
-      res.json({
-        success: true,
-        message: "✅ Category added successfully",
-        category: newCategory,
-      });
-    } catch (error) {
-      console.error("❌ Error adding category:", error);
-      res.status(500).json({ success: false, message: "Server error" });
-    }
-  });
-});
-
-/* ==========================================================
-   ✅ 2. Admin View (SORTED BY PRIORITY)
-========================================================== */
-router.post("/view", async (req, res) => {
-  try {
-    const categories = await Category_table.find({}).sort({ priority: 1 });
-    res.json({ success: true, categories });
+    return res.json({
+      success: true,
+      message: "Category added successfully",
+      category: newCategory,
+    });
   } catch (error) {
-    console.error("❌ Error fetching categories:", error);
-    res.status(500).json({ success: false, message: "Server error" });
+    console.error("Error adding category:", error);
+
+    // Clean up Cloudinary if the database save failed.
+    if (uploadedImage && !saved) {
+      try {
+        await deleteCloudinaryImageOrQueue(uploadedImage.public_id);
+      } catch (cleanupError) {
+        console.error("Unable to clean up failed category upload:", cleanupError);
+      }
+    }
+
+    return res.status(error.status === 400 ? 400 : 500).json({
+      success: false,
+      message: error.status === 400 ? error.message : "Server error while adding category",
+    });
   }
 });
 
 /* ==========================================================
-   ⭐ 2B. Update Priority (Drag & Drop)
+   2. ADMIN VIEW
 ========================================================== */
+
+router.post("/view", async (req, res) => {
+  try {
+    const categories = await Category_table.find({})
+      .sort({ priority: 1 });
+
+    return res.json({
+      success: true,
+      categories,
+    });
+  } catch (error) {
+    console.error("Error fetching categories:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Server error",
+    });
+  }
+});
+
+/* ==========================================================
+   3. UPDATE PRIORITY (DRAG & DROP)
+========================================================== */
+
 router.post("/update-priority", async (req, res) => {
   try {
     const { categories } = req.body;
 
-    for (let c of categories) {
-      await Category_table.findByIdAndUpdate(c.id, { priority: c.priority });
+    if (!Array.isArray(categories)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid categories data",
+      });
     }
 
-    res.json({ success: true });
+    await Promise.all(
+      categories.map((category) =>
+        Category_table.findByIdAndUpdate(category.id, {
+          priority: category.priority,
+        })
+      )
+    );
+
+    return res.json({
+      success: true,
+      message: "Category priorities updated successfully",
+    });
   } catch (error) {
-    res.status(500).json({
+    console.error("Error updating priorities:", error);
+
+    return res.status(500).json({
       success: false,
       message: "Error updating priorities",
       error: error.message,
@@ -100,134 +127,209 @@ router.post("/update-priority", async (req, res) => {
 });
 
 /* ==========================================================
-   ✅ 3. User View (SORTED BY PRIORITY)
+   4. USER VIEW
 ========================================================== */
+
 router.get("/userview", async (req, res) => {
   try {
-    const categories = await Category_table.find({}).sort({ priority: 1 });
-    res.json({ success: true, categories });
+    const categories = await Category_table.find({})
+      .sort({ priority: 1 });
+
+    return res.json({
+      success: true,
+      categories,
+    });
   } catch (error) {
-    console.error("❌ Error fetching categories for user view:", error);
-    res.status(500).json({ success: false, message: "Server error" });
+    console.error("Error fetching categories for user view:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Server error",
+    });
   }
 });
 
 /* ==========================================================
-   ✅ 4. Search Category (also sorted by priority)
+   5. SEARCH CATEGORY
 ========================================================== */
+
 router.post("/search", async (req, res) => {
   try {
     const { category_name } = req.body;
 
-    const categories = await Category_table
-      .find({
-        category_name: { $regex: category_name, $options: "i" },
-      })
-      .sort({ priority: 1 });
+    if (!category_name) {
+      return res.status(400).json({
+        success: false,
+        message: "Category name is required",
+      });
+    }
 
-    res.json({ success: true, categories });
+    const categories = await Category_table.find({
+      category_name: {
+        $regex: category_name,
+        $options: "i",
+      },
+    }).sort({ priority: 1 });
+
+    return res.json({
+      success: true,
+      categories,
+    });
   } catch (error) {
-    console.error("❌ Error searching category:", error);
-    res.status(500).json({ success: false, message: "Server error" });
+    console.error("Error searching category:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Server error",
+    });
   }
 });
 
 /* ==========================================================
-   ✅ 5. Update Category (Name + Optional Image)
+   6. UPDATE CATEGORY (NAME + OPTIONAL IMAGE)
 ========================================================== */
-router.put("/update/:id", (req, res) => {
-  const singleUpload = upload.single("image");
 
-  singleUpload(req, res, async (err) => {
-    if (err) {
-      console.error("❌ Multer error during update:", err);
+router.put("/update/:id", upload.single("image"), async (req, res) => {
+  let uploadedImage = null;
+  let saved = false;
+
+  try {
+    const { id } = req.params;
+    const { category_name } = req.body;
+
+    if (!category_name) {
       return res.status(400).json({
         success: false,
-        message: err.message || "File upload error",
+        message: "Category name is required",
       });
     }
 
-    try {
-      const { id } = req.params;
-      const { category_name } = req.body;
+    const category = await Category_table.findById(id);
 
-      if (!category_name) {
-        return res.status(400).json({
-          success: false,
-          message: "Category name is required",
-        });
+    if (!category) {
+      return res.status(404).json({
+        success: false,
+        message: "Category not found",
+      });
+    }
+
+    const oldImageUrl = category.category_image;
+    const oldImagePublicId = category.category_image_public_id;
+
+    if (req.file) {
+      uploadedImage = await uploadImage(req.file, "fh-general-equipments/categories");
+      category.category_image = uploadedImage.secure_url;
+      category.category_image_public_id = uploadedImage.public_id;
+    }
+
+    category.category_name = category_name;
+
+    await category.save();
+    saved = true;
+
+    // Delete the previous image only after the database save succeeds.
+    if (uploadedImage && oldImagePublicId) {
+      const usage = await findImageUsage({
+        publicId: oldImagePublicId,
+        secureUrl: oldImageUrl,
+        exclude: { model: Category_table, id: category._id },
+      });
+      if (!hasImageUsage(usage)) {
+        await deleteCloudinaryImageOrQueue(oldImagePublicId);
       }
+    }
 
-      const category = await Category_table.findById(id);
-      if (!category) {
-        return res.status(404).json({
-          success: false,
-          message: "Category not found",
-        });
-      }
+    return res.json({
+      success: true,
+      message: "Category updated successfully",
+      category,
+    });
+  } catch (error) {
+    console.error("Error updating category:", error);
 
-      let newImagePath = category.category_image;
-
-      if (req.file) {
-        newImagePath = `uploads/categories/${req.file.filename}`;
-
-        const oldPath = `/var/www/${category.category_image}`;
-        if (fs.existsSync(oldPath)) {
-          fs.unlinkSync(oldPath);
+    // Remove the newly uploaded image if the database update failed.
+    if (uploadedImage) {
+      if (!saved) {
+        try {
+          await deleteCloudinaryImageOrQueue(uploadedImage.public_id);
+        } catch (cleanupError) {
+          console.error("Unable to clean up failed category replacement:", cleanupError);
         }
       }
-
-      category.category_name = category_name;
-      category.category_image = newImagePath;
-
-      await category.save();
-
-      res.json({
-        success: true,
-        message: "Category updated successfully",
-        category,
-      });
-    } catch (error) {
-      console.error("❌ Error updating category:", error);
-      res.status(500).json({
-        success: false,
-        message: "Server error",
-      });
     }
-  });
+
+    return res.status(error.status === 400 ? 400 : 500).json({
+      success: false,
+      message: error.status === 400 ? error.message : "Server error while updating category",
+    });
+  }
 });
 
 /* ==========================================================
-   ✅ 6. Delete Category
+   7. DELETE CATEGORY
 ========================================================== */
+
 router.post("/delete", async (req, res) => {
   try {
     const { id } = req.body;
 
     if (!id) {
-      return res
-        .status(400)
-        .json({ success: false, message: "Category ID required" });
+      return res.status(400).json({
+        success: false,
+        message: "Category ID required",
+      });
     }
 
     const category = await Category_table.findById(id);
-    if (!category)
-      return res
-        .status(404)
-        .json({ success: false, message: "Category not found" });
 
-    if (category.category_image) {
-      const imagePath = `/var/www/${category.category_image}`;
-      if (fs.existsSync(imagePath)) fs.unlinkSync(imagePath);
+    if (!category) {
+      return res.status(404).json({
+        success: false,
+        message: "Category not found",
+      });
     }
+
+    const usage = category.category_image_public_id
+      ? await findImageUsage({
+        publicId: category.category_image_public_id,
+        secureUrl: category.category_image,
+        exclude: { model: Category_table, id: category._id },
+      })
+      : null;
 
     await Category_table.findByIdAndDelete(id);
 
-    res.json({ success: true, message: "✅ Category deleted successfully" });
+    if (category.category_image_public_id && !hasImageUsage(usage)) {
+      await deleteCloudinaryImageOrQueue(category.category_image_public_id);
+    }
+
+    return res.json({
+      success: true,
+      message: "Category and its Cloudinary image deleted successfully",
+    });
+
   } catch (error) {
-    console.error("❌ Error deleting category:", error);
-    res.status(500).json({ success: false, message: "Server error" });
+    console.error("Category deletion error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Server error while deleting category",
+    });
   }
+});
+/* ==========================================================
+   MULTER ERROR HANDLER
+========================================================== */
+
+router.use((err, req, res, next) => {
+  if (isUploadError(err)) {
+    return res.status(400).json({
+      success: false,
+      message: err.message,
+    });
+  }
+
+  next(err);
 });
 
 export default router;

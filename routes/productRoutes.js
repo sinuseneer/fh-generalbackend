@@ -1,34 +1,23 @@
 import express from "express";
-import multer from "multer";
-import fs from "fs";
 import Product_table from "../models/productModel.js";
 import ProductImageTable from "../models/productImage.js";
+import { createImageUpload, isUploadError } from "../utils/imageUpload.js";
+import {
+  deleteCloudinaryImageOrQueue,
+  uploadImage,
+} from "../utils/cloudinaryImages.js";
+import { findImageUsage, hasImageUsage } from "../utils/imageReferences.js";
 
 const router = express.Router();
 
-
-/* ============================================================
-   🧱 Multer Configuration for Product Images
-============================================================ */
-const productStorage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    const dir = "/var/www/uploads/products";
-  
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    cb(null, dir);
-  },
-  filename: (req, file, cb) => {
-    cb(null, Date.now() + "-" + file.originalname);
-  },
-});
-const uploadProductImage = multer({ storage: productStorage });
-// const storage = multer.memoryStorage(); // <--- store in memory not disk
-// const upload = multer({ storage });
+const uploadProductImage = createImageUpload({ fileSize: 10 * 1024 * 1024 });
 
 // admin edit produt images 
 router.put("/replace-image/:imageId",
   uploadProductImage.single("image"),
   async (req, res) => {
+    let uploadedImage;
+    let saved = false;
     try {
       const { imageId } = req.params;
 
@@ -49,17 +38,29 @@ router.put("/replace-image/:imageId",
         });
       }
 
-      // 3️⃣ Build correct absolute path
-      const oldFilePath = `/var/www/${image.image_path}`;
-
-      // 4️⃣ Delete old file safely
-      if (fs.existsSync(oldFilePath)) {
-        fs.unlinkSync(oldFilePath);
-      }
-
-      // 5️⃣ Update image path in database
-      image.image_path = `uploads/products/${req.file.filename}`;
+      const oldImage = {
+        publicId: image.public_id,
+        secureUrl: image.image_path,
+      };
+      uploadedImage = await uploadImage(req.file, "fh-general-equipments/products");
+      image.image_path = uploadedImage.secure_url;
+      image.public_id = uploadedImage.public_id;
       await image.save();
+      saved = true;
+
+      if (oldImage.publicId) {
+        try {
+          const usage = await findImageUsage({
+            ...oldImage,
+            exclude: { model: ProductImageTable, id: image._id },
+          });
+          if (!hasImageUsage(usage)) {
+            await deleteCloudinaryImageOrQueue(oldImage.publicId);
+          }
+        } catch (cleanupError) {
+          console.error("Unable to clean up replaced product image:", cleanupError);
+        }
+      }
 
       res.json({
         success: true,
@@ -67,7 +68,12 @@ router.put("/replace-image/:imageId",
       });
 
     } catch (err) {
-      res.status(500).json({
+      if (uploadedImage && !saved) {
+        await deleteCloudinaryImageOrQueue(uploadedImage.public_id).catch((cleanupError) => {
+          console.error("Unable to clean up failed product replacement:", cleanupError);
+        });
+      }
+      res.status(err.status === 400 ? 400 : 500).json({
         success: false,
         message: err.message
       });
@@ -90,16 +96,15 @@ router.delete("/delete-image/:imageId", async (req, res) => {
       });
     }
 
-    // 2️⃣ Build correct file path
-    const filePath = `/var/www/${image.image_path}`;
-
-    // 3️⃣ Delete physically from server
-    if (fs.existsSync(filePath)) {
-      fs.unlinkSync(filePath);
-    }
-
-    // 4️⃣ Delete from database
+    const usage = await findImageUsage({
+      publicId: image.public_id,
+      secureUrl: image.image_path,
+      exclude: { model: ProductImageTable, id: image._id },
+    });
     await ProductImageTable.findByIdAndDelete(imageId);
+    if (image.public_id && !hasImageUsage(usage)) {
+      await deleteCloudinaryImageOrQueue(image.public_id);
+    }
 
     res.json({
       success: true,
@@ -363,7 +368,11 @@ router.get("/userview/:id", async (req, res) => {
     const mainImg = images.find((img) => img.is_main);
     const otherImages = images.filter((img) => !img.is_main);
 
-    const baseUrl = `${req.protocol}://${req.get("host")}/`;
+    const getImageUrl = (imagePath) => {
+      if (!imagePath) return null;
+      if (/^https?:\/\//i.test(imagePath)) return imagePath;
+      return `${req.protocol}://${req.get("host")}/${imagePath.replace(/^\/+/, "")}`;
+    };
 
     // Step 3: Build response object
     const productDetails = {
@@ -375,8 +384,8 @@ router.get("/userview/:id", async (req, res) => {
       category: product.CAT_ID?.category_name || "Uncategorized",
 
       // Absolute URLs for images
-      main_image: mainImg ? `${baseUrl}${mainImg.image_path}` : null,
-      gallery: otherImages.map((img) => `${baseUrl}${img.image_path}`),
+      main_image: mainImg ? getImageUrl(mainImg.image_path) : null,
+      gallery: otherImages.map((img) => getImageUrl(img.image_path)),
     };
 
     res.status(200).json({
@@ -495,66 +504,6 @@ router.post("/add", async (req, res) => {
   }
 });
 
-//
-
-
-
-// router.post("/add", upload.single("image"), async (req, res) => {
-//   try {
-//     const { prod_id, product_name, CAT_ID, description, product_info } = req.body;
-
-//     if (!prod_id || !product_name || !CAT_ID || !description) {
-//       return res.status(400).json({
-//         success: false,
-//         message: "All required fields must be filled",
-//       });
-//     }
-
-//     let webpImagePath = null;
-
-//     // If image uploaded → convert to WEBP
-//     if (req.file) {
-//       const uploadsDir = "uploads/products";
-
-//       if (!fs.existsSync(uploadsDir)) {
-//         fs.mkdirSync(uploadsDir, { recursive: true });
-//       }
-
-//       // Generate unique filename
-//       const filename = `${Date.now()}.webp`;
-//       webpImagePath = path.join(uploadsDir, filename);
-
-//       // Convert using Sharp
-//       await sharp(req.file.buffer)
-//         .webp({ quality: 80 })
-//         .toFile(webpImagePath);
-//     }
-
-//     // Create product
-//     const newProduct = new Product_table({
-//       prod_id,
-//       product_name,
-//       CAT_ID,
-//       description,
-//       product_info,
-//       image: webpImagePath, // store converted webp
-//     });
-
-//     await newProduct.save();
-
-//     res.status(201).json({
-//       success: true,
-//       message: "✅ Product added successfully",
-//       product: newProduct,
-//     });
-
-//   } catch (error) {
-//     console.error("❌ Error adding product:", error);
-//     res.status(500).json({ success: false, message: "Server error" });
-//   }
-// });
-
-
 /* ============================================================
    ✅ 2. Upload Product Images
 ============================================================ */
@@ -571,21 +520,66 @@ router.post("/upload-images/:PRODUCT_ID", (req, res) => {
       const { PRODUCT_ID } = req.params;
       const { mainIndex } = req.body;
       const files = req.files;
+      const uploadedImages = [];
+      const insertedImages = [];
 
       if (!files || files.length === 0)
         return res.status(400).json({ success: false, message: "No images uploaded" });
 
-      const imageDocs = files.map((file, index) => ({
-        PRODUCT_ID,
-        image_path: `uploads/products/${file.filename}`,
-        is_main: parseInt(mainIndex) === index,
-      }));
+      const product = await Product_table.findById(PRODUCT_ID);
+      if (!product) {
+        return res.status(404).json({ success: false, message: "Product not found" });
+      }
 
-      await ProductImageTable.insertMany(imageDocs);
+      try {
+        for (const [index, file] of files.entries()) {
+          const image = await uploadImage(file, "fh-general-equipments/products");
+          uploadedImages.push(image);
+          const imageDoc = await ProductImageTable.create({
+            PRODUCT_ID,
+            image_path: image.secure_url,
+            public_id: image.public_id,
+            is_main: Number.parseInt(mainIndex, 10) === index,
+          });
+          insertedImages.push(imageDoc);
+        }
+
+        const selectedMainIndex = Number.parseInt(mainIndex, 10);
+        if (Number.isInteger(selectedMainIndex) && selectedMainIndex >= 0 && selectedMainIndex < files.length) {
+          await ProductImageTable.updateMany(
+            { PRODUCT_ID, _id: { $nin: insertedImages.map((image) => image._id) } },
+            { $set: { is_main: false } }
+          );
+        }
+      } catch (error) {
+        let recordsRemoved = true;
+        if (insertedImages.length) {
+          try {
+            await ProductImageTable.deleteMany({
+              _id: { $in: insertedImages.map((image) => image._id) },
+            });
+          } catch (rollbackError) {
+            recordsRemoved = false;
+            console.error("Unable to roll back product image records:", rollbackError);
+          }
+        }
+        if (recordsRemoved) {
+          await Promise.all(uploadedImages.map((image) =>
+            deleteCloudinaryImageOrQueue(image.public_id).catch((cleanupError) => {
+              console.error("Unable to clean up failed product upload:", cleanupError);
+            })
+          ));
+        }
+        throw error;
+      }
+
       res.json({ success: true, message: "✅ Images uploaded successfully" });
     } catch (error) {
       console.error("❌ Error uploading product images:", error);
-      res.status(500).json({ success: false, message: "Server error" });
+      res.status(error.status === 400 ? 400 : 500).json({
+        success: false,
+        message: error.status === 400 ? error.message : "Server error",
+      });
     }
   });
 });
@@ -679,37 +673,8 @@ router.post("/searchProducts", async (req, res) => {
 /* ============================================================
    ✅ 6. Delete Product
 ============================================================ */
-// router.post("/delete", async (req, res) => {
-//   try {
-//     const { id } = req.body;
-//     if (!id)
-//       return res.status(400).json({ success: false, message: "Product ID required" });
-
-//     const product = await Product_table.findById(id);
-//     if (!product)
-//       return res.status(404).json({ success: false, message: "Product not found" });
-
-//     // Delete product images
-//     const images = await ProductImageTable.find({ PRODUCT_ID: id });
-//     for (const img of images) {
-//       if (img.image_path && fs.existsSync(img.image_path)) {
-//         fs.unlinkSync(img.image_path);
-//       }
-//     }
-
-//     await ProductImageTable.deleteMany({ PRODUCT_ID: id });
-//     await Product_table.findByIdAndDelete(id);
-
-//     res.json({ success: true, message: "✅ Product deleted successfully" });
-//   } catch (error) {
-//     console.error("❌ Error deleting product:", error);
-//     res.status(500).json({ success: false, message: "Server error" });
-//   }
-// });
-
-
 /* ============================================================
-   📌 DELETE PRODUCT (NO PHYSICAL FILE DELETE)
+   DELETE PRODUCT
 ============================================================ */
 router.post("/delete", async (req, res) => {
   try {
@@ -724,15 +689,25 @@ router.post("/delete", async (req, res) => {
       return res.status(404).json({ success: false, message: "Product not found" });
     }
 
-    // 1️⃣ Delete image records from MongoDB ONLY
+    const images = await ProductImageTable.find({ PRODUCT_ID: id });
     await ProductImageTable.deleteMany({ PRODUCT_ID: id });
 
-    // 2️⃣ Delete product from DB
     await Product_table.findByIdAndDelete(id);
+
+    for (const image of images) {
+      if (!image.public_id) continue;
+      const usage = await findImageUsage({
+        publicId: image.public_id,
+        secureUrl: image.image_path,
+      });
+      if (!hasImageUsage(usage)) {
+        await deleteCloudinaryImageOrQueue(image.public_id);
+      }
+    }
 
     res.json({
       success: true,
-      message: "Product deleted successfully (images NOT removed from media)",
+      message: "Product deleted successfully",
     });
   } catch (error) {
     res.status(500).json({ success: false, message: "Server error" });
@@ -824,8 +799,15 @@ router.get("/view", async (req, res) => {
   }
 });
 
-
-
-
+router.use((err, req, res, next) => {
+  if (isUploadError(err)) {
+    return res.status(400).json({
+      success: false,
+      message: err.message,
+      code: err.code || null,
+    });
+  }
+  next(err);
+});
 
 export default router;

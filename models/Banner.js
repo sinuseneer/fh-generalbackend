@@ -7,8 +7,10 @@ const bannerSchema = new mongoose.Schema(
     subtitle: { type: String, required: false },
 
     // Images
-    image: { type: String, required: true },        // desktop image
-    mobileImage: { type: String, required: true },  // mobile image
+    image: { type: String, required: true },
+    image_public_id: { type: String, default: null },
+    mobileImage: { type: String, required: false, default: null },
+    mobileImage_public_id: { type: String, default: null },
 
     // Text mode: "light" or "dark"
     textMode: { type: String, enum: ["light", "dark"], default: "dark" },

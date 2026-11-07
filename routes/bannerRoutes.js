@@ -1,79 +1,68 @@
 import express from "express";
-import multer from "multer";
-import path from "path";
-import fs from "fs";
 import BannerTable from "../models/Banner.js";
+import { createImageUpload, isUploadError } from "../utils/imageUpload.js";
+import {
+  deleteCloudinaryImageOrQueue,
+  uploadImage,
+} from "../utils/cloudinaryImages.js";
+import { findImageUsage, hasImageUsage } from "../utils/imageReferences.js";
 
 const router = express.Router();
+const upload = createImageUpload({ fileSize: 10 * 1024 * 1024 });
+const bannerFields = upload.fields([
+  { name: "desktopImage", maxCount: 1 },
+  { name: "mobileImage", maxCount: 1 },
+]);
 
 // Maximum active banners allowed on frontend
 const MAX_ACTIVE = 6;
 
 // =================================================
-//                  MULTER STORAGE
-// =================================================
-const UPLOAD_ROOT = "/var/www/uploads/banners";  
-
-const storage = multer.diskStorage({
-  destination(req, file, cb) {
-    if (!fs.existsSync(UPLOAD_ROOT)) {
-      fs.mkdirSync(UPLOAD_ROOT, { recursive: true });
-    }
-    cb(null, UPLOAD_ROOT);
-  },
-  filename(req, file, cb) {
-    cb(null, Date.now() + path.extname(file.originalname));
-  },
-});
-
-const upload = multer({ storage });
-
-// =================================================
 //            CREATE BANNER (desktop + mobile)
 // =================================================
-router.post("/", (req, res) => {
-  const fieldsUpload = upload.fields([
-    { name: "desktopImage", maxCount: 1 },
-    { name: "mobileImage", maxCount: 1 },
-  ]);
-
-  fieldsUpload(req, res, async (err) => {
-    if (err) {
-      console.error("Multer error:", err);
-      return res.status(400).json({ message: err.message });
+router.post("/", bannerFields, async (req, res) => {
+  const uploadedImages = [];
+  let saved = false;
+  try {
+    if (!req.files?.desktopImage?.[0]) {
+      return res.status(400).json({ message: "Desktop image is required" });
     }
 
-    try {
-      if (!req.files || !req.files.desktopImage) {
-        return res.status(400).json({ message: "Desktop image is required" });
-      }
+    const desktop = await uploadImage(req.files.desktopImage[0], "fh-general-equipments/banners");
+    uploadedImages.push(desktop);
+    const mobile = req.files.mobileImage?.[0]
+      ? await uploadImage(req.files.mobileImage[0], "fh-general-equipments/banners")
+      : null;
+    if (mobile) uploadedImages.push(mobile);
 
-      const desktopImage = `uploads/banners/${req.files.desktopImage[0].filename}`;
-      const mobileImage = req.files.mobileImage
-        ? `uploads/banners/${req.files.mobileImage[0].filename}`
-        : null;
+    const last = await BannerTable.findOne().sort({ order: -1 }).lean();
+    const nextOrder = last ? last.order + 1 : 0;
+    const banner = new BannerTable({
+      title: req.body.title || "",
+      subtitle: req.body.subtitle || "",
+      image: desktop.secure_url,
+      image_public_id: desktop.public_id,
+      mobileImage: mobile?.secure_url || null,
+      mobileImage_public_id: mobile?.public_id || null,
+      textMode: req.body.textMode === "light" ? "light" : "dark",
+      active: false,
+      order: nextOrder,
+    });
 
-      // Determine order (append to end)
-      const last = await BannerTable.findOne().sort({ order: -1 }).lean();
-      const nextOrder = last ? last.order + 1 : 0;
-
-      const banner = new BannerTable({
-        title: req.body.title || "",
-        subtitle: req.body.subtitle || "",
-        image: desktopImage,
-        mobileImage,
-        textMode: req.body.textMode === "light" ? "light" : "dark",
-        active: false, // default inactive
-        order: nextOrder,
-      });
-
-      await banner.save();
-      res.status(201).json({ success: true, banner });
-    } catch (error) {
-      console.error("Upload ERROR:", error);
-      res.status(500).json({ message: error.message });
+    await banner.save();
+    saved = true;
+    return res.status(201).json({ success: true, banner });
+  } catch (error) {
+    console.error("Upload ERROR:", error);
+    if (!saved) {
+      await Promise.all(uploadedImages.map((image) =>
+        deleteCloudinaryImageOrQueue(image.public_id).catch((cleanupError) => {
+          console.error("Unable to clean up failed banner upload:", cleanupError);
+        })
+      ));
     }
-  });
+    return res.status(error.status === 400 ? 400 : 500).json({ message: error.message });
+  }
 });
 
 // =================================================
@@ -183,66 +172,115 @@ router.put("/reorder", async (req, res) => {
 
 // =================================================
 //           UPDATE BANNER (TEXT + IMAGES)
-//             (DO NOT DELETE OLD FILES)
+//             replace supplied images only
 // =================================================
-router.put("/:id", (req, res) => {
-  const updateUpload = upload.fields([
-    { name: "desktopImage", maxCount: 1 },
-    { name: "mobileImage", maxCount: 1 },
-  ]);
+router.put("/:id", bannerFields, async (req, res) => {
+  const uploadedImages = [];
+  let saved = false;
+  try {
+    const banner = await BannerTable.findById(req.params.id);
+    if (!banner) return res.status(404).json({ message: "Banner not found" });
 
-  updateUpload(req, res, async (err) => {
-    if (err) return res.status(400).json({ message: err.message });
-
-    try {
-      const banner = await BannerTable.findById(req.params.id);
-      if (!banner) return res.status(404).json({ message: "Banner not found" });
-
-      // Replace Desktop (do NOT delete old file)
-      if (req.files && req.files.desktopImage) {
-        banner.image = `uploads/banners/${req.files.desktopImage[0].filename}`;
-      }
-
-      // Replace Mobile (do NOT delete old file)
-      if (req.files && req.files.mobileImage) {
-        banner.mobileImage = `uploads/banners/${req.files.mobileImage[0].filename}`;
-      }
-
-      // Update text fields
-      banner.title = req.body.title ?? banner.title;
-      banner.subtitle = req.body.subtitle ?? banner.subtitle;
-      banner.textMode = req.body.textMode ?? banner.textMode;
-
-      await banner.save();
-      res.json({ success: true, banner });
-    } catch (error) {
-      console.error("UPDATE ERROR:", error);
-      res.status(500).json({ message: error.message });
+    const oldImages = [];
+    if (req.files?.desktopImage?.[0]) {
+      oldImages.push({
+        publicId: banner.image_public_id,
+        secureUrl: banner.image,
+      });
+      const image = await uploadImage(req.files.desktopImage[0], "fh-general-equipments/banners");
+      uploadedImages.push(image);
+      banner.image = image.secure_url;
+      banner.image_public_id = image.public_id;
     }
-  });
+
+    if (req.files?.mobileImage?.[0]) {
+      oldImages.push({
+        publicId: banner.mobileImage_public_id,
+        secureUrl: banner.mobileImage,
+      });
+      const image = await uploadImage(req.files.mobileImage[0], "fh-general-equipments/banners");
+      uploadedImages.push(image);
+      banner.mobileImage = image.secure_url;
+      banner.mobileImage_public_id = image.public_id;
+    }
+
+    banner.title = req.body.title ?? banner.title;
+    banner.subtitle = req.body.subtitle ?? banner.subtitle;
+    banner.textMode = req.body.textMode ?? banner.textMode;
+
+    await banner.save();
+    saved = true;
+
+    for (const oldImage of oldImages) {
+      if (!oldImage.publicId) continue;
+      const usage = await findImageUsage({
+        publicId: oldImage.publicId,
+        secureUrl: oldImage.secureUrl,
+      });
+      if (!hasImageUsage(usage)) {
+        await deleteCloudinaryImageOrQueue(oldImage.publicId);
+      }
+    }
+
+    return res.json({ success: true, banner });
+  } catch (error) {
+    console.error("UPDATE ERROR:", error);
+    if (!saved) {
+      await Promise.all(uploadedImages.map((image) =>
+        deleteCloudinaryImageOrQueue(image.public_id).catch((cleanupError) => {
+          console.error("Unable to clean up failed banner replacement:", cleanupError);
+        })
+      ));
+    }
+    return res.status(error.status === 400 ? 400 : 500).json({ message: error.message });
+  }
 });
 
 // =================================================
-//               DELETE BANNER ONLY FROM DB
-//        (KEEP ALL IMAGES SAFELY IN FILE SYSTEM)
+//               DELETE BANNER AND CLOUDINARY IMAGES
 // =================================================
 router.delete("/:id", async (req, res) => {
   try {
     const banner = await BannerTable.findById(req.params.id);
     if (!banner) return res.status(404).json({ message: "Banner not found" });
 
-    // ❗ DO NOT DELETE FILES
-    // All images remain under /var/www/uploads/banners
+    const oldImageUsage = await Promise.all([
+      [banner.image_public_id, banner.image],
+      [banner.mobileImage_public_id, banner.mobileImage],
+    ].map(([publicId, secureUrl]) => publicId
+      ? findImageUsage({
+        publicId,
+        secureUrl,
+        exclude: { model: BannerTable, id: banner._id },
+      })
+      : null));
 
     await banner.deleteOne();
 
+    const oldImages = [
+      [banner.image_public_id, oldImageUsage[0]],
+      [banner.mobileImage_public_id, oldImageUsage[1]],
+    ];
+    for (const [publicId, usage] of oldImages) {
+      if (publicId && !hasImageUsage(usage)) {
+        await deleteCloudinaryImageOrQueue(publicId);
+      }
+    }
+
     res.json({
-      message: "Banner deleted from database only. Images retained.",
+      message: "Banner deleted successfully",
     });
   } catch (error) {
     console.error("DELETE ERROR:", error);
     res.status(500).json({ message: error.message });
   }
+});
+
+router.use((err, req, res, next) => {
+  if (isUploadError(err)) {
+    return res.status(400).json({ message: err.message });
+  }
+  next(err);
 });
 
 export default router;
